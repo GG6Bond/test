@@ -339,14 +339,16 @@ class GpipeAsync:
                     #             如果不是判断是否为A100
                     #             最后则为普通T4节点
                     if self.gather_recv:
+                        # 使用 gather 方法从 gather_data 列表中收集数据到目标节点
                         self.gather_comm.gather(self.input_micro_batches[i], gather_list=gather_data,
                                                 dst=self.gather_group_size - 1, stream=cupy_recv_stream)
                         # 将list数组使用torch的concat进行合并
                         gather_data.pop(self.pp_rank_gather)
+                        # 将收到的数据合并成一个大张量
                         self.concatenated_tensor[i] = torch.cat(gather_data, dim=0)
                         self.concatenated_tensor[i].requires_grad_(True)
                     elif self.scatter_recv:
-                        # 接收的数据被存储在input_micro_batches[i]中
+                        # 接收的数据被存储在input_micro_batches[i]中，从源节点接收数据
                         self.scatter_comm.scatter(self.input_micro_batches[i], scatter_list=gather_data, src=0,
                                                   stream=cupy_recv_stream)
                     elif self.device_gpu == 1:
@@ -669,6 +671,7 @@ class GpipeAsync:
                         cached_output_micro_batches[i].backward(gradient=self.output_micro_batches_grad[i])
                     self.torch_comp_stream.record_event(self.backward_comp_ready_events[i])
             else:  # receive, compute and send zhongjianjiedian
+                # 接收
                 with torch.cuda.stream(self.torch_recv_stream):
                     cupy_recv_stream = cupy.cuda.ExternalStream(self.torch_recv_stream.cuda_stream)
                     self.profile_mark_backward_recv_start(i)
@@ -694,6 +697,7 @@ class GpipeAsync:
                             self.comm.recv(self.output_micro_batches_grad[i], src=self.post_node_rank,
                                            stream=cupy_recv_stream)
                     self.torch_recv_stream.record_event(self.backward_recv_ready_events[i])
+                # 计算
                 with torch.cuda.stream(self.torch_comp_stream):
                     self.torch_comp_stream.wait_event(self.backward_recv_ready_events[i])
                     self.profile_mark_backward_comp_start(i)
@@ -704,6 +708,7 @@ class GpipeAsync:
                         cached_output_micro_batches[i].backward(gradient=self.output_micro_batches_grad[i])
 
                     self.torch_comp_stream.record_event(self.backward_comp_ready_events[i])
+                # 发送
                 with torch.cuda.stream(self.torch_send_stream):
                     cupy_send_stream = cupy.cuda.ExternalStream(self.torch_send_stream.cuda_stream)
                     self.torch_send_stream.wait_event(self.backward_comp_ready_events[i])
