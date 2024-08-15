@@ -298,7 +298,8 @@ class GpipeAsync:
                 # 计算阶段
                 with torch.cuda.stream(self.torch_comp_stream):
                     self.profile_mark_forward_comp_start(i)
-                    # 如果是A100要复制3份数据，
+                    # 如果是A100要复制3份数据
+                    # TODO: Q：A100为什么复制三份一样的数据？
                     if self.device_gpu==1:
                         self.concatenated_tensor[i] = self.input_micro_batches[i].repeat(3)
                         current_micro_output = self.model(self.concatenated_tensor[i])
@@ -323,8 +324,7 @@ class GpipeAsync:
                         self.comm.send(current_micro_output.data, dst=self.post_node_rank, stream=cupy_send_stream)
                     self.profile_mark_forward_send_end(i)
 
-            # 接收阶段
-            # 只接收数据，不发送数据
+            # 最后的节点，只接收数据，不发送数据
             elif self.pp_rank == self.pipeline_group_size - 1 or self.pp_rank >= 11:  # Only receive input from last node, do not send
                 with torch.cuda.stream(self.torch_recv_stream):
                     cupy_recv_stream = cupy.cuda.ExternalStream(self.torch_recv_stream.cuda_stream)
@@ -339,43 +339,33 @@ class GpipeAsync:
                     #             如果不是判断是否为A100
                     #             最后则为普通T4节点
                     if self.gather_recv:
-                        # 使用 gather 方法从 gather_data 列表中收集数据到目标节点
+                        # 使用 gather 方法从 gather_data列表（来自其他节点的数据）收集到本节点
                         self.gather_comm.gather(self.input_micro_batches[i], gather_list=gather_data,
                                                 dst=self.gather_group_size - 1, stream=cupy_recv_stream)
                         # 将list数组使用torch的concat进行合并
+                        # 将当前节点的数据从gather_data移除，因为目标节点已经收集到了数据
                         gather_data.pop(self.pp_rank_gather)
                         # 将收到的数据合并成一个大张量
                         self.concatenated_tensor[i] = torch.cat(gather_data, dim=0)
                         self.concatenated_tensor[i].requires_grad_(True)
                     elif self.scatter_recv:
-                        # 接收的数据被存储在input_micro_batches[i]中，从源节点接收数据
+                        # 接收的数据被存储在input_micro_batches[i]中，从源节点接收数据，将分发到scatter_list中
                         self.scatter_comm.scatter(self.input_micro_batches[i], scatter_list=gather_data, src=0,
                                                   stream=cupy_recv_stream)
+                    # 不属于gather和Scatter小圈子
                     elif self.device_gpu == 1:
-                        # 不属于gather和Scatter小圈子，说明上级是A100或是T4
                         self.comm.recv(self.concatenated_tensor[i], src=self.pre_node_rank, stream=cupy_recv_stream)
                     else:
-                        # 否则为T4节点
+                        # 否则为T4节点，其中源头节点的大小取决于pipeline_group的大小
                         if self.pipeline_group_size > 10:
                             src = self.pre_node_rank - 2
                             self.comm.recv(self.input_micro_batches[i], src=src, stream=cupy_recv_stream)
                         else:
                             self.comm.recv(self.input_micro_batches[i], src=self.pre_node_rank, stream=cupy_recv_stream)
 
-                    #  如果Scatter不为空，判断是否为非0节点
-                    # if self.scatter_comm is not None :
-                    #     self.scatter_group_size = get_scatter_world_size()
-                    #     if self.pp_rank !=0:
-                    #         self.scatter_comm.scatter(self.input_micro_batches[i], scatter_list=gather_data, src=0,
-                    #                                   stream=cupy_recv_stream)
-                    # elif self.device_gpu =="A100":
-                    #     #  不属于gather小圈子，说明上级是A100或是T4
-                    #     self.comm.recv(self.concatenated_tensor[i], src=self.pre_node_rank, stream=cupy_recv_stream)
-                    # else:
-                    #     # 否则为T4节点
-                    #     self.comm.recv(self.input_micro_batches[i], src=self.pre_node_rank, stream=cupy_recv_stream)
                     self.torch_recv_stream.record_event(self.forward_recv_ready_events[i])
-
+                
+                # 计算
                 with torch.cuda.stream(self.torch_comp_stream):
                     self.torch_comp_stream.wait_event(self.forward_recv_ready_events[i])
                     self.profile_mark_forward_comp_start(i)
@@ -391,8 +381,8 @@ class GpipeAsync:
                             current_micro_output = self.model(self.concatenated_tensor[i])
                         else:
                             current_micro_output = self.model(self.input_micro_batches[i])
-
                     self.torch_comp_stream.record_event(self.forward_comp_ready_events[i])
+                    
             # 中间的节点
             else:
                 # 数据接收
@@ -543,6 +533,7 @@ class GpipeAsync:
         else:
             assert (target is None)
         # 标记当前节点是否在接收或者发送梯度
+        # TODO: 理解下面的变量
         self.gather_grad_recv = False
         self.gather_grad_send = False
         self.scatter_grad_send = False
@@ -570,11 +561,12 @@ class GpipeAsync:
         
         for i in range(self.micro_batch_num):
             # 定义空的缓存区
-
             gather_data = [torch.zeros_like(self.input_micro_batches[i]) for _ in
                            range(4)]
             scatter_data = [torch.zeros_like(self.input_micro_batches[i]) for _ in
                             range(4)]
+            
+            # 最后的节点，计算，发送梯度数据
             if self.pp_rank == self.pipeline_group_size - 1 or self.pp_rank >= 11:  # only send grad back to last node, do not receive
                 # 计算
                 with torch.cuda.stream(self.torch_comp_stream):
@@ -610,16 +602,16 @@ class GpipeAsync:
                     #     print(self.concatenated_tensor[i].requires_grad == True)
                     # 判断是否存在scatter或者gather，然后判断是否为A100，否则T4。
                     if self.gather_grad_send:
+                        # 将张量按照gather_group_size - 1切分
                         chunked_tensors = torch.chunk(self.concatenated_tensor[i].grad,
                                                       chunks=self.gather_group_size - 1, dim=0)
-
                         # 转换为List[torch.Tensor]
                         scatter_tensor_list = [split_tensor for split_tensor in chunked_tensors]
                         # scatter_tensor_list = [split_tensor for split_tensor in split_tensors]
                         new_tensor = torch.zeros_like(scatter_tensor_list[0])
                         # 添加在最后的位置
                         scatter_tensor_list.append(new_tensor)
-                        # 用gather通讯组的Scatter方法
+                        # 用gather通讯组的Scatter方法，将切分后的张量分散发送到其他节点
                         self.gather_comm.scatter(self.input_micro_batches[i].grad, scatter_list=scatter_tensor_list,
                                                  src=self.gather_group_size - 1, stream=cupy_send_stream)
 
@@ -644,16 +636,16 @@ class GpipeAsync:
                             dst = self.pre_node_rank - 2
                             self.comm.send(self.input_micro_batches[i].grad, dst=dst,stream=cupy_send_stream)
                         else:
-
                             self.comm.send(self.input_micro_batches[i].grad, dst=self.pre_node_rank,stream=cupy_send_stream)
-
                     self.profile_mark_backward_send_end(i)
                 # self.input_micro_batches[i].grad = None
                 # torch.cuda.synchronize()  # Notice this for memory optimization
-            elif self.first_node:  # only receive grad from previous node, do not send
+            # first_node，接收梯度，计算
+            elif self.first_node: 
                 with torch.cuda.stream(self.torch_recv_stream):
                     cupy_recv_stream = cupy.cuda.ExternalStream(self.torch_recv_stream.cuda_stream)
                     self.profile_mark_backward_recv_start(i)
+                    # TODO: Q：这里为什么不用区分A100和T4
                     if self.gather_grad_recv:
                         #   执行对应的命令
                         self.gather_comm.scatter(self.output_micro_batches_grad[i], scatter_list=gather_data,
@@ -670,6 +662,7 @@ class GpipeAsync:
                     else:
                         cached_output_micro_batches[i].backward(gradient=self.output_micro_batches_grad[i])
                     self.torch_comp_stream.record_event(self.backward_comp_ready_events[i])
+            # 接收、计算、发送梯度数据
             else:  # receive, compute and send zhongjianjiedian
                 # 接收
                 with torch.cuda.stream(self.torch_recv_stream):
@@ -679,7 +672,7 @@ class GpipeAsync:
                         # gather接收是T4，仅接受即可
                         self.gather_comm.scatter(self.output_micro_batches_grad[i], scatter_list=gather_data,
                                                  src=self.gather_group_size - 1, stream=cupy_recv_stream)
-                    #     对应的是A100，接收后需要处理
+                    # 对应的是A100，接收后需要处理
                     elif self.scatter_grad_recv:
                         self.scatter_comm.gather(self.output_micro_batches_grad[i], gather_list=scatter_data,
                                                  dst=self.pp_rank_scatter, stream=cupy_recv_stream)
@@ -706,7 +699,6 @@ class GpipeAsync:
                         cached_output_micro_batches[i].backward(gradient=self.concat_micro_batches_grad[i])
                     else:
                         cached_output_micro_batches[i].backward(gradient=self.output_micro_batches_grad[i])
-
                     self.torch_comp_stream.record_event(self.backward_comp_ready_events[i])
                 # 发送
                 with torch.cuda.stream(self.torch_send_stream):
